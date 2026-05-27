@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytest-swarm"
+version = "0.1.0"
+description = "Run parametrized test variants in parallel threads — with correct fixture lifecycle"
+requires-python = ">=3.9"
+dependencies = ["pytest>=7.0"]
+
+[project.entry-points."pytest11"]
+pytest-swarm = "pytest_swarm.plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-p", "pytester"]
