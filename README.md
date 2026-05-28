@@ -251,3 +251,7 @@ Fixture functions are called directly inside threads (bypassing pytest's
 `SetupState`), so function-scope setup runs truly in parallel. Broad-scope
 fixtures go through normal pytest setup in the main thread to preserve shared
 instance semantics.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
