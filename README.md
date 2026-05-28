@@ -20,9 +20,7 @@ to roughly `max(variant_times)` instead of `sum(variant_times)`.
 
 `pytest-swarm` operates one level lower: it parallelizes the **variants of a
 single parametrized test** while everything else — fixture lifecycle, test
-ordering, reporting — stays exactly as in a normal sequential run. The two
-approaches complement each other; you can use `pytest-swarm` alongside
-`pytest-xdist`.
+ordering, reporting — stays exactly as in a normal sequential run.
 
 ### Thread safety is your responsibility
 
