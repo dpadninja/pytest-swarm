@@ -123,6 +123,7 @@ Works with all function-scope parametrization forms:
 | `@pytest.mark.parametrize("n", [...])` | ✓ |
 | `@pytest.fixture(params=[...])` | ✓ |
 | `@pytest.mark.parametrize("fix", [...], indirect=True)` | ✓ |
+| `pytest_generate_tests` hook | ✓ |
 | fixture depending on another fixture | ✓ |
 | `pytestmark = pytest.mark.usefixtures(...)` | ✓ |
 
