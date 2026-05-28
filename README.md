@@ -1,6 +1,6 @@
 # pytest-swarm
 
-Run parametrized test variants in parallel threads — with correct fixture lifecycle.
+A pytest plugin that runs parametrized test variants in parallel threads — with correct fixture lifecycle.
 
 ## What problem does it solve?
 
