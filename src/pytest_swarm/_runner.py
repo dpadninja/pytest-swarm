@@ -39,10 +39,7 @@ class WorkerConfig:
 
     @classmethod
     def from_config(cls, config: pytest.Config) -> WorkerConfig:
-        cli: int | None = config.getoption("swarm_workers")
-        env_str = os.environ.get("PYTEST_SWARM_WORKERS")
-        env: int | None = int(env_str) if env_str is not None else None
-        return cls(global_max=cli if cli is not None else env)
+        return cls(global_max=config.getoption("swarm_workers"))
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +165,13 @@ class SwarmPlugin:
 # ---------------------------------------------------------------------------
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    _env = os.environ.get("PYTEST_SWARM_WORKERS")
     parser.addoption(
         "--swarm-workers",
         dest="swarm_workers",
         metavar="N",
         type=int,
-        default=None,
+        default=int(_env) if _env is not None else None,
         help=(
             "Maximum number of worker threads for @pytest.mark.swarm tests. "
             "Overrides PYTEST_SWARM_WORKERS env var. Defaults to CPU count. "
