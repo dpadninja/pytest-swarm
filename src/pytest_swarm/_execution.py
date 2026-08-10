@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from ._fixture_helpers import (
     _fixture_scope_name,
     _is_same_for_all_items,
 )
-from ._resolver import _resolve_fixture
+from ._resolver import _MinimalRequest, _drain_generator, _resolve_fixture
 
 # Scope resolution order for sorting pre-fetch dependencies:
 # wider scopes must be resolved before narrower ones.
@@ -133,6 +134,60 @@ class _StubSetupState:
     def _teardown_with_finalization(self, node: Any) -> None: pass
 
 
+def _prefetch_one(
+    name: str,
+    ref_item: pytest.Item,
+    session: pytest.Session,
+    all_broad: dict[str, Any],
+    fm: Any,
+    cache: BroadScopeCache,
+) -> None:
+    """Resolve *name* and any broad-scope fixtures it depends on, storing each
+    one into *cache* under its own scope/finalizers as soon as it is computed.
+
+    A fixture reached only *transitively* - as another broad-scope fixture's
+    dependency, rather than directly via the outer loop in
+    _prefetch_broad_scope - must still get its own cache.store() call. Storing
+    depth-first, in true dependency order, as each name is resolved (instead
+    of resolving a whole dependency chain and only storing the top-level
+    name) guarantees that: relying on the *sort order* of same-scope siblings
+    to happen to visit a dependency before its dependent is not reliable,
+    since Python's string hash randomization makes that order vary between
+    interpreter runs.
+    """
+    if name in all_broad:
+        return
+    defs = fm.getfixturedefs(name, ref_item)
+    if not defs:
+        return
+    scope = _fixture_scope_name(defs[-1].scope)
+    if scope == "function":
+        return
+
+    fd = defs[-1]
+    fins: list = []
+    kwargs: dict[str, Any] = {}
+    for dep in fd.argnames:
+        if dep == "request":
+            kwargs["request"] = _MinimalRequest(ref_item, fd, all_broad, fins, session)
+            continue
+        _prefetch_one(dep, ref_item, session, all_broad, fm, cache)
+        if dep not in all_broad:
+            # function-scope dependency, or a plain (non-fixture) value
+            _resolve_fixture(dep, ref_item, session, all_broad, fins)
+        kwargs[dep] = all_broad[dep]
+
+    result = fd.func(**kwargs)
+    if inspect.isgenerator(result):
+        value = next(result)
+        fins.append(lambda gen=result: _drain_generator(gen))
+    else:
+        value = result
+
+    all_broad[name] = value
+    cache.store(scope, name, value, fins)
+
+
 def _prefetch_broad_scope(
     items: list[pytest.Item],
     session: pytest.Session,
@@ -157,17 +212,9 @@ def _prefetch_broad_scope(
         return _SCOPE_ORDER.get(_fixture_scope_name(defs[-1].scope), 99) if defs else 99
 
     for name in sorted(all_deps, key=_scope_key):
-        if name in all_broad or not _is_same_for_all_items(name, items):
+        if not _is_same_for_all_items(name, items):
             continue
-        defs = fm.getfixturedefs(name, ref_item)
-        if not defs:
-            continue
-        scope = _fixture_scope_name(defs[-1].scope)
-        if scope == "function":
-            continue
-        fins: list = []
-        _resolve_fixture(name, ref_item, session, all_broad, fins)
-        cache.store(scope, name, all_broad[name], fins)
+        _prefetch_one(name, ref_item, session, all_broad, fm, cache)
 
 
 def _run_one_item(

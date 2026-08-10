@@ -266,6 +266,41 @@ class TestSessionScope:
         assert ev.count("SETUP") == 2
         assert ev.count("TEARDOWN") == 2
 
+    def test_transitively_shared_session_fixture_setup_once(self, pytester):
+        """
+        A session fixture reached only *transitively* - as another broad-scope
+        fixture's dependency, not directly by the test - must still be
+        pre-fetched and cached exactly once, regardless of the (undefined,
+        hash-randomization-dependent) order in which same-scope siblings are
+        visited.
+        """
+        counter = str(pytester.path / "counter.txt")
+        pytester.makepyfile(f"""
+            import pytest
+
+            @pytest.fixture(scope="session")
+            def resource():
+                open({counter!r}, "a").write("SETUP\\n")
+                return object()
+
+            @pytest.fixture(scope="session", autouse=True)
+            def derived(resource):
+                return {{"resource": resource}}
+
+            @pytest.fixture
+            def consumer(resource):
+                return {{"resource": resource}}
+
+            @pytest.mark.swarm(max_workers=16)
+            @pytest.mark.parametrize("n", list(range(16)))
+            def test_thing(n, consumer):
+                assert consumer["resource"] is not None
+        """)
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=16)
+        ev = _events(counter)
+        assert ev.count("SETUP") == 1
+
 
 # ---------------------------------------------------------------------------
 # function scope (default)
