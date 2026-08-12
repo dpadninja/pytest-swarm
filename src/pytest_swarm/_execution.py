@@ -141,6 +141,7 @@ def _prefetch_one(
     all_broad: dict[str, Any],
     fm: Any,
     cache: BroadScopeCache,
+    _from_fd: Any = None,
 ) -> None:
     """Resolve *name* and any broad-scope fixtures it depends on, storing each
     one into *cache* under its own scope/finalizers as soon as it is computed.
@@ -154,24 +155,42 @@ def _prefetch_one(
     to happen to visit a dependency before its dependent is not reliable,
     since Python's string hash randomization makes that order vary between
     interpreter runs.
+
+    *_from_fd* is set when resolving a same-named dependency of an overriding
+    fixture (e.g. `def resource(resource): ...`) - see _resolve_fixture in
+    _resolver.py for why this is needed to avoid infinite recursion.
     """
     if name in all_broad:
         return
     defs = fm.getfixturedefs(name, ref_item)
     if not defs:
         return
-    scope = _fixture_scope_name(defs[-1].scope)
+
+    if _from_fd is not None and _from_fd in defs:
+        idx = defs.index(_from_fd) - 1
+        if idx < 0:
+            raise LookupError(
+                f"Fixture '{name}' requests itself and there is no wider "
+                "fixture of the same name to fall back to."
+            )
+        fd = defs[idx]
+    else:
+        fd = defs[-1]
+
+    scope = _fixture_scope_name(fd.scope)
     if scope == "function":
         return
 
-    fd = defs[-1]
     fins: list = []
     kwargs: dict[str, Any] = {}
     for dep in fd.argnames:
         if dep == "request":
             kwargs["request"] = _MinimalRequest(ref_item, fd, all_broad, fins, session)
             continue
-        _prefetch_one(dep, ref_item, session, all_broad, fm, cache)
+        _prefetch_one(
+            dep, ref_item, session, all_broad, fm, cache,
+            _from_fd=fd if dep == name else None,
+        )
         if dep not in all_broad:
             # function-scope dependency, or a plain (non-fixture) value
             _resolve_fixture(dep, ref_item, session, all_broad, fins)
@@ -293,7 +312,17 @@ def _run_items_parallel_full(
     The main thread's SetupState is never touched. Broad-scope fixtures are
     pre-fetched here and persisted in *cache* for reuse by later groups.
     """
-    _prefetch_broad_scope(items, session, cache)
+    # Broad-scope fixtures run here, in the main thread, outside of any
+    # per-item CallInfo wrapper. A raising fixture must not escape this
+    # function - left uncaught it would blow past pytest_runtestloop and
+    # crash the whole session with INTERNALERROR instead of failing the
+    # affected tests. Stash it and fold it into marker_exc below so it is
+    # reported the normal way, once per item, via _do_setup/CallInfo.
+    prefetch_exc: BaseException | None = None
+    try:
+        _prefetch_broad_scope(items, session, cache)
+    except BaseException as exc:
+        prefetch_exc = exc
     resolved_base = cache.merged()
 
     # Evaluate marker hooks (skip, xfail, …) with a stub SetupState so they
@@ -309,6 +338,10 @@ def _run_items_parallel_full(
                 marker_exc[item.nodeid] = exc
     finally:
         session._setupstate = orig_ss
+
+    if prefetch_exc is not None:
+        for item in items:
+            marker_exc.setdefault(item.nodeid, prefetch_exc)
 
     lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

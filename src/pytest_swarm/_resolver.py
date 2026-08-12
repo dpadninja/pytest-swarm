@@ -51,7 +51,11 @@ class _MinimalRequest:
 
     def getfixturevalue(self, name: str) -> Any:
         if name not in self._resolved:
-            _resolve_fixture(name, self._item, self._session, self._resolved, self._finalizers)
+            from_fd = self._fd if name == self._fd.argname else None
+            _resolve_fixture(
+                name, self._item, self._session, self._resolved, self._finalizers,
+                _from_fd=from_fd,
+            )
         return self._resolved[name]
 
     def applymarker(self, marker: Any) -> None:
@@ -71,11 +75,19 @@ def _resolve_fixture(
     session: pytest.Session,
     resolved: dict[str, Any],
     finalizers: list,
+    _from_fd: Any = None,
 ) -> Any:
     """Recursively resolve *name* and its dependencies in the current thread.
 
     Resolved values accumulate in *resolved*; teardown callables are appended to
     *finalizers* in setup order (caller must run them reversed).
+
+    *_from_fd* is set when resolving a same-named dependency of an overriding
+    fixture (e.g. `def resource(resource): ...`, the standard pytest pattern
+    for extending a fixture defined elsewhere). In that case the definition
+    one level up the override chain is picked instead of the most specific
+    one again - which is the overriding fixture itself, and would recurse
+    forever.
     """
     if name in resolved:
         return resolved[name]
@@ -92,11 +104,23 @@ def _resolve_fixture(
             resolved[name] = callspec.params[name]
         return resolved.get(name)
 
-    fd = defs[-1]
+    if _from_fd is not None and _from_fd in defs:
+        idx = defs.index(_from_fd) - 1
+        if idx < 0:
+            raise LookupError(
+                f"Fixture '{name}' requests itself and there is no wider "
+                "fixture of the same name to fall back to."
+            )
+        fd = defs[idx]
+    else:
+        fd = defs[-1]
+
     kwargs: dict[str, Any] = {}
     for dep in fd.argnames:
         if dep == "request":
             kwargs["request"] = _MinimalRequest(item, fd, resolved, finalizers, session)
+        elif dep == name:
+            kwargs[dep] = _resolve_fixture(dep, item, session, resolved, finalizers, _from_fd=fd)
         else:
             kwargs[dep] = _resolve_fixture(dep, item, session, resolved, finalizers)
 
