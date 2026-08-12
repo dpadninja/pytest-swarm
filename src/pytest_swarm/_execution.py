@@ -12,7 +12,6 @@ import pytest
 
 from ._fixture_helpers import (
     _can_run_parallel_setup,
-    _collect_deps,
     _extra_fixture_names,
     _fixture_scope_name,
     _is_same_for_all_items,
@@ -217,20 +216,33 @@ def _prefetch_broad_scope(
     Skips fixtures that are already cached or differ across items (indirect params).
     Resolves in scope order (session before module before class) so that
     narrower-scope fixtures that depend on broader ones find their deps ready.
+
+    Only the item's *direct* fixture names seed the loop below - not the full
+    transitive closure. A fixture's own dependencies must be resolved by its
+    own recursive call in _prefetch_one (which walks fd.argnames in
+    declaration order), exactly as real pytest's FixtureDef.execute does.
+    Flattening the whole closure into this loop would let leaf dependencies
+    that happen to share a scope with their dependent get resolved
+    independently, in a tie-broken order that has nothing to do with
+    declaration order, before their dependent ever gets a turn.
     """
     fm = session._fixturemanager
     ref_item = items[0]
     all_broad = cache.merged()
 
-    all_deps: set[str] = set()
-    _collect_deps(ref_item._fixtureinfo.argnames, ref_item, fm, all_deps)
-    _collect_deps(_extra_fixture_names(ref_item), ref_item, fm, all_deps)
+    top_level: list[str] = []
+    seen: set[str] = set()
+    for name in (*ref_item._fixtureinfo.argnames, *_extra_fixture_names(ref_item)):
+        if name in seen or name == "request":
+            continue
+        seen.add(name)
+        top_level.append(name)
 
     def _scope_key(name: str) -> int:
         defs = fm.getfixturedefs(name, ref_item)
         return _SCOPE_ORDER.get(_fixture_scope_name(defs[-1].scope), 99) if defs else 99
 
-    for name in sorted(all_deps, key=_scope_key):
+    for name in sorted(top_level, key=_scope_key):
         if not _is_same_for_all_items(name, items):
             continue
         _prefetch_one(name, ref_item, session, all_broad, fm, cache)
