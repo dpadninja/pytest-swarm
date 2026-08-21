@@ -14,7 +14,7 @@ from ._helpers import _events
 def test_autouse_session_fixture_does_not_block_swarm_setup(pytester):
     """
     A session-scope autouse fixture is present in item.fixturenames but must
-    not push the group onto the serial-setup path.
+    not push the group off the parallel path.
     """
     pytester.makeconftest("""
 import pytest

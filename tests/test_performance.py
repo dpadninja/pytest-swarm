@@ -99,6 +99,72 @@ def test_mixed_scope_setup_speedup(pytester):
     elapsed = time.monotonic() - t0
     res.assert_outcomes(passed=_N)
     assert elapsed < 4.5, (
-        f"Expected ~3 s (broad-scope serial + function-scope parallel), "
+        f"Expected ~3 s (broad-scope resolved once + function-scope parallel), "
         f"elapsed={elapsed:.2f}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cases that used to be demoted off the parallel path
+# ---------------------------------------------------------------------------
+
+def test_builtin_fixture_no_longer_serializes_setup(pytester):
+    """
+    A supported built-in fixture (tmp_path) in the dependency chain used to demote the
+    whole group to serial setup: N × T. Function-scope setup now runs per thread, so
+    the group costs ~T.
+    """
+    pytester.makepyfile(f"""
+        import time, pytest
+
+        @pytest.fixture
+        def slow_setup(tmp_path):
+            time.sleep({_SLEEP})
+            return tmp_path
+
+        @pytest.mark.swarm(max_workers={_N})
+        @pytest.mark.parametrize("n", range({_N}))
+        def test_thing(slow_setup, n):
+            assert slow_setup.exists()
+    """)
+    t0 = time.monotonic()
+    res = pytester.runpytest("-v")
+    elapsed = time.monotonic() - t0
+    res.assert_outcomes(passed=_N)
+    assert elapsed < _N * _SLEEP * 0.6, (
+        f"Expected parallel setup (< {_N * _SLEEP * 0.6:.1f}s), not serial "
+        f"({_N * _SLEEP:.1f}s); elapsed={elapsed:.2f}s"
+    )
+
+
+def test_indirect_broad_scope_no_longer_serializes_setup(pytester):
+    """
+    Same for an indirect-parametrized broad-scope fixture. The broad-scope instances
+    themselves are still built once each in the main thread — what parallelizes here
+    is the function-scope fixture hanging off them.
+    """
+    pytester.makepyfile(f"""
+        import time, pytest
+
+        @pytest.fixture(scope="module")
+        def conn(request):
+            return "c%s" % request.param
+
+        @pytest.fixture
+        def slow_setup(conn):
+            time.sleep({_SLEEP})
+            return conn
+
+        @pytest.mark.swarm(max_workers={_N})
+        @pytest.mark.parametrize("conn", list(range({_N})), indirect=True)
+        def test_thing(slow_setup, conn):
+            assert slow_setup == conn
+    """)
+    t0 = time.monotonic()
+    res = pytester.runpytest("-v")
+    elapsed = time.monotonic() - t0
+    res.assert_outcomes(passed=_N)
+    assert elapsed < _N * _SLEEP * 0.6, (
+        f"Expected parallel setup (< {_N * _SLEEP * 0.6:.1f}s), not serial "
+        f"({_N * _SLEEP:.1f}s); elapsed={elapsed:.2f}s"
     )

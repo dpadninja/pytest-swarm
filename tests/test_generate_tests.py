@@ -92,14 +92,14 @@ def test_items(n):
 
 
 # ---------------------------------------------------------------------------
-# Indirect parametrization — serial setup path
+# Indirect parametrization — one broad-scope instance per parameter value
 # ---------------------------------------------------------------------------
 
 class TestIndirectParametrize:
-    """pytest_generate_tests with indirect=True → serial setup path."""
+    """pytest_generate_tests with indirect=True."""
 
     def test_indirect_runs_and_passes(self, pytester):
-        """Indirect params via pytest_generate_tests run through the serial path."""
+        """Indirect params via pytest_generate_tests reach every item intact."""
         pytester.makeconftest("""
 def pytest_generate_tests(metafunc):
     if "fix" in metafunc.fixturenames:
@@ -142,7 +142,7 @@ def test_items(fix):
         assert sorted(_read(log)) == ["p", "q", "r"]
 
     def test_indirect_module_scope_fixture(self, pytester):
-        """Indirect params on a module-scope fixture use the serial setup path."""
+        """Indirect params on a module-scope fixture get one instance per value."""
         pytester.makeconftest("""
 def pytest_generate_tests(metafunc):
     if "mod_fix" in metafunc.fixturenames:

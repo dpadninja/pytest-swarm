@@ -156,7 +156,7 @@ instance (parallel setup).
 
 Autouse session/module-scope fixtures from third-party plugins (e.g.
 `_session_faker` from pytest-Faker) are present in `item.fixturenames` but are
-correctly ignored when deciding the execution path. They don't force a serial
+correctly ignored when deciding the execution path. They don't force a sequential
 fallback.
 
 ## Non-parallel tests
@@ -226,9 +226,23 @@ observe `pytest_runtest_protocol` (pytest-xdist, pytest-rerunfailures, etc.) use
 - **Thread safety is the test's responsibility.** Shared mutable state accessed
   from parallel test bodies must be protected by locks or other synchronization.
 
-- **Built-in pytest fixtures** (`tmp_path`, `capfd`, `monkeypatch`, …) in the
-  fixture dependency chain may not work in the parallel-setup path. The plugin
-  falls back to serial setup automatically when it detects them.
+- **Some built-in pytest fixtures cannot be parallelized.** `capsys`, `capfd`,
+  `caplog`, `monkeypatch` and `recwarn` mutate process-global state — captured file
+  descriptors, logging handlers, `os.environ` — which no amount of per-thread
+  instancing makes safe. A group that needs one of them runs sequentially through
+  pytest's ordinary protocol, and says so. `tmp_path`, `tmp_path_factory`,
+  `pytestconfig`, `cache`, `doctest_namespace` and `record_property` are supported
+  and stay on the parallel path.
+
+  Run with `--swarm-explain` to see how each group was executed and why:
+
+  ```
+  $ pytest --swarm-explain
+  ================================ swarm plan =================================
+  parallel     8 item(s)  8 worker(s)   tests/test_api.py::test_fetch
+  sequential   3 item(s)  no threads    tests/test_io.py::test_capture
+              built-in fixture 'capsys' is not supported in worker threads
+  ```
 
 ## How it works
 

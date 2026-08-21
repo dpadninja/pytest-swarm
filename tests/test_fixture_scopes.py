@@ -207,7 +207,7 @@ class TestSessionScope:
     def test_session_fixture_shared_across_serial_setup_groups(self, pytester):
         """
         session-scope fixture must not be re-created between groups that take the
-        serial-setup path (indirect module-scope + class).
+        parametrized broad-scope path (indirect module-scope + class).
         """
         counter = str(pytester.path / "counter.txt")
         pytester.makepyfile(f"""

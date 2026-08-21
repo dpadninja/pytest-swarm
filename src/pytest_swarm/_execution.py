@@ -11,11 +11,12 @@ from typing import Any
 import pytest
 
 from ._fixture_helpers import (
-    _can_run_parallel_setup,
+    _collect_deps,
     _extra_fixture_names,
     _fixture_scope_name,
-    _is_same_for_all_items,
+    _parametrized_broad_fixtures,
 )
+from ._plan import MODE_SEQUENTIAL, GroupPlan
 from ._resolver import _MinimalRequest, _drain_generator, _resolve_fixture
 
 # Scope resolution order for sorting pre-fetch dependencies:
@@ -89,6 +90,22 @@ class BroadScopeCache:
             self.klass[name] = value
             self.klass_fin.extend(fins)
 
+    def add_finalizers(self, scope: str, fins: list) -> None:
+        """Record finalizers at *scope* without publishing a shared value.
+
+        Used for parametrized broad-scope fixtures: several instances of the same
+        name are alive at once, so no single one of them can own the cache slot,
+        but every one of them must still be torn down at the right boundary.
+        """
+        if scope == "session":
+            self.session_fin.extend(fins)
+        elif scope == "package":
+            self.package_fin.extend(fins)
+        elif scope == "module":
+            self.module_fin.extend(fins)
+        else:  # class
+            self.klass_fin.extend(fins)
+
     def teardown_class(self) -> None:
         _teardown_silent(self.klass_fin)
         self.klass.clear()
@@ -139,11 +156,11 @@ def _prefetch_one(
     session: pytest.Session,
     all_broad: dict[str, Any],
     fm: Any,
-    cache: BroadScopeCache,
+    store: Any,
     _from_fd: Any = None,
 ) -> None:
     """Resolve *name* and any broad-scope fixtures it depends on, storing each
-    one into *cache* under its own scope/finalizers as soon as it is computed.
+    one via *store* under its own scope/finalizers as soon as it is computed.
 
     A fixture reached only *transitively* - as another broad-scope fixture's
     dependency, rather than directly via the outer loop in
@@ -187,7 +204,7 @@ def _prefetch_one(
             kwargs["request"] = _MinimalRequest(ref_item, fd, all_broad, fins, session)
             continue
         _prefetch_one(
-            dep, ref_item, session, all_broad, fm, cache,
+            dep, ref_item, session, all_broad, fm, store,
             _from_fd=fd if dep == name else None,
         )
         if dep not in all_broad:
@@ -203,17 +220,24 @@ def _prefetch_one(
         value = result
 
     all_broad[name] = value
-    cache.store(scope, name, value, fins)
+    store(scope, name, value, fins)
+
+
+def _scope_key(name: str, ref_item: pytest.Item, fm: Any) -> int:
+    """Sort key placing wider scopes before narrower ones."""
+    defs = fm.getfixturedefs(name, ref_item)
+    return _SCOPE_ORDER.get(_fixture_scope_name(defs[-1].scope), 99) if defs else 99
 
 
 def _prefetch_broad_scope(
     items: list[pytest.Item],
     session: pytest.Session,
     cache: BroadScopeCache,
-) -> None:
+) -> dict[str, Any]:
     """Pre-fetch broad-scope fixtures in the main thread and persist them in *cache*.
 
-    Skips fixtures that are already cached or differ across items (indirect params).
+    Skips fixtures that are already cached or differ across items (parametrized ones
+    are resolved per parameter value by _prefetch_parametrized_broad_scope).
     Resolves in scope order (session before module before class) so that
     narrower-scope fixtures that depend on broader ones find their deps ready.
 
@@ -229,6 +253,7 @@ def _prefetch_broad_scope(
     fm = session._fixturemanager
     ref_item = items[0]
     all_broad = cache.merged()
+    parametrized = set(_parametrized_broad_fixtures(items))
 
     top_level: list[str] = []
     seen: set[str] = set()
@@ -238,14 +263,121 @@ def _prefetch_broad_scope(
         seen.add(name)
         top_level.append(name)
 
-    def _scope_key(name: str) -> int:
-        defs = fm.getfixturedefs(name, ref_item)
-        return _SCOPE_ORDER.get(_fixture_scope_name(defs[-1].scope), 99) if defs else 99
+    for name in sorted(top_level, key=lambda n: _scope_key(n, ref_item, fm)):
+        if name in parametrized:
+            continue  # handled per parameter value, see _prefetch_parametrized_broad_scope
+        _prefetch_one(name, ref_item, session, all_broad, fm, cache.store)
 
-    for name in sorted(top_level, key=_scope_key):
-        if not _is_same_for_all_items(name, items):
+    return all_broad
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    """Equality that never raises — parameter values can have exotic __eq__."""
+    try:
+        return bool(a == b)
+    except Exception:
+        return a is b
+
+
+def _relevant_param_names(
+    tainted: list[str], ref_item: pytest.Item, fm: Any, parametrized: set
+) -> list[str]:
+    """Parameter names whose values decide which instances a *tainted* fixture needs."""
+    relevant: set = set()
+    for name in tainted:
+        if name in parametrized:
+            relevant.add(name)
+        defs = fm.getfixturedefs(name, ref_item)
+        if not defs:
             continue
-        _prefetch_one(name, ref_item, session, all_broad, fm, cache)
+        deps: set = set()
+        _collect_deps(defs[-1].argnames, ref_item, fm, deps)
+        relevant.update(deps & parametrized)
+    return sorted(relevant)
+
+
+def _prefetch_parametrized_broad_scope(
+    items: list[pytest.Item],
+    session: pytest.Session,
+    cache: BroadScopeCache,
+    all_broad: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Resolve broad-scope fixtures that differ per item — one instance per value.
+
+    This is the thing pytest itself cannot do. A FixtureDef holds a single live
+    value, so pytest must tear down the instance for parameter N before it can build
+    the one for N+1; every item but the last would end up holding a finalized object
+    once the bodies run in parallel. Resolving here, in the main thread, with one
+    instance per distinct combination of parameter values, is what lets
+    indirect-parametrized broad-scope fixtures take the parallel path at all.
+
+    Returns nodeid -> {fixture name: value}, an overlay applied on top of the shared
+    cache for each item. Finalizers go to *cache* under the fixture's own scope, so
+    all live instances are torn down together at the right boundary.
+    """
+    tainted = _parametrized_broad_fixtures(items)
+    if not tainted:
+        return {}
+
+    fm = session._fixturemanager
+    ref_item = items[0]
+    parametrized: set = set()
+    for item in items:
+        callspec = getattr(item, "callspec", None)
+        if callspec:
+            parametrized.update(callspec.params)
+
+    relevant = _relevant_param_names(tainted, ref_item, fm, parametrized)
+    tainted = sorted(tainted, key=lambda n: _scope_key(n, ref_item, fm))
+
+    def _signature(item: pytest.Item) -> list:
+        callspec = getattr(item, "callspec", None)
+        params = callspec.params if callspec else {}
+        return [params.get(name) for name in relevant]
+
+    # Bucket items into equivalence classes: same parameter values -> same instances.
+    buckets: list[tuple[list, list[pytest.Item]]] = []
+    for item in items:
+        signature = _signature(item)
+        for known, members in buckets:
+            if len(known) == len(signature) and all(
+                _same_value(a, b) for a, b in zip(known, signature)
+            ):
+                members.append(item)
+                break
+        else:
+            buckets.append((signature, [item]))
+
+    overlay: dict[str, dict[str, Any]] = {}
+    for _, members in buckets:
+        rep = members[0]
+        local = dict(all_broad)
+
+        def _store(scope: str, name: str, value: Any, fins: list) -> None:
+            cache.add_finalizers(scope, fins)
+
+        for name in tainted:
+            _prefetch_one(name, rep, session, local, fm, _store)
+
+        values = {name: local[name] for name in tainted if name in local}
+        for member in members:
+            overlay[member.nodeid] = values
+
+    return overlay
+
+
+#: Built-in fixtures that need touching in the main thread before workers start.
+#: tmp_path_factory creates its base directory lazily and is not thread-safe about it.
+_BUILTIN_WARMUPS = {
+    "tmp_path_factory": lambda value: value.getbasetemp(),
+}
+
+
+def _warm_builtins(resolved_base: dict[str, Any]) -> None:
+    """Force lazy initialization of built-in fixtures while still single-threaded."""
+    for name, warm in _BUILTIN_WARMUPS.items():
+        if name in resolved_base:
+            warm(resolved_base[name])
 
 
 def _run_one_item(
@@ -331,8 +463,11 @@ def _run_items_parallel_full(
     # affected tests. Stash it and fold it into marker_exc below so it is
     # reported the normal way, once per item, via _do_setup/CallInfo.
     prefetch_exc: BaseException | None = None
+    overlay: dict[str, dict[str, Any]] = {}
     try:
-        _prefetch_broad_scope(items, session, cache)
+        all_broad = _prefetch_broad_scope(items, session, cache)
+        _warm_builtins(all_broad)
+        overlay = _prefetch_parametrized_broad_scope(items, session, cache, all_broad)
     except BaseException as exc:
         prefetch_exc = exc
     resolved_base = cache.merged()
@@ -358,93 +493,18 @@ def _run_items_parallel_full(
     lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
-            pool.submit(_run_one_item, item, session, resolved_base, marker_exc, lock)
+            pool.submit(
+                _run_one_item,
+                item,
+                session,
+                {**resolved_base, **overlay.get(item.nodeid, {})},
+                marker_exc,
+                lock,
+            )
             for item in items
         ]
         for f in futures:
             f.result()
-
-
-# ---------------------------------------------------------------------------
-# Serial setup path: sequential setup, parallel bodies, sequential teardown
-# ---------------------------------------------------------------------------
-
-def _run_group_serial_setup(
-    items: list[pytest.Item],
-    session: pytest.Session,
-    max_workers: int,
-    nextitem: pytest.Item | None,
-) -> None:
-    """
-    Serial setup → parallel test bodies → serial teardown.
-
-    Used when broad-scope fixtures are indirect-parametrized (different values per
-    item) or contain built-in pytest fixtures that require a real FixtureRequest.
-
-    *nextitem* is passed to the teardown of the last item so pytest keeps alive any
-    fixtures that the next sequential test still needs (session-scope etc.).
-    """
-    from _pytest.reports import TestReport
-    from _pytest.runner import CallInfo, call_and_report
-
-    setup_reps: list[TestReport] = []
-    call_reps: dict[str, Any] = {}
-    teardown_reps: list[TestReport] = []
-    lock = threading.Lock()
-
-    # Phase 1: serial setup.
-    # teardown_exact after each setup removes the item from SetupState.stack without
-    # running fixture finalizers — broad-scope fixtures have no functional finalizers
-    # here and stay alive in pytest's fixture cache.
-    for i, item in enumerate(items):
-        rep = call_and_report(item, "setup", log=False)
-        setup_reps.append(rep)
-        if i < len(items) - 1:
-            session._setupstate.teardown_exact(items[i + 1])
-
-    # Phase 2: parallel test bodies.
-    def _call_one(item: pytest.Item, setup_rep: TestReport) -> None:
-        if not setup_rep.passed:
-            return
-
-        def _do_call() -> None:
-            args = {arg: item.funcargs[arg] for arg in item._fixtureinfo.argnames}
-            if item.instance is not None:
-                item.function(item.instance, **args)
-            else:
-                item.function(**args)
-
-        call_info = CallInfo.from_call(_do_call, "call", reraise=(SystemExit, KeyboardInterrupt))
-        rep = item.ihook.pytest_runtest_makereport(item=item, call=call_info)
-        with lock:
-            call_reps[item.nodeid] = rep
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_call_one, item, setup_reps[i]) for i, item in enumerate(items)]
-        for f in futures:
-            f.result()
-
-    # Phase 3: teardown.
-    # Last item: real teardown (tears down broad-scope fixtures for this group).
-    # Others: synthetic no-op teardown reports so makereport hookwrappers fire for
-    # every item.
-    for i, item in enumerate(items):
-        if i < len(items) - 1:
-            noop = CallInfo.from_call(lambda: None, "teardown")
-            teardown_reps.append(item.ihook.pytest_runtest_makereport(item=item, call=noop))
-        else:
-            teardown_reps.append(call_and_report(item, "teardown", log=False, nextitem=nextitem))
-
-    # Emit all reports via pytest_runtest_protocol so hookwrappers on it are called.
-    for i, item in enumerate(items):
-        nid = item.nodeid
-        reps: list = [setup_reps[i]]
-        if nid in call_reps:
-            reps.append(call_reps[nid])
-        reps.append(teardown_reps[i])
-        item._swarm_reports = reps  # type: ignore[attr-defined]
-        item.ihook.pytest_runtest_protocol(item=item, nextitem=None)
-        del item._swarm_reports  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -456,18 +516,16 @@ def run_group(
     session: pytest.Session,
     max_workers: int,
     cache: BroadScopeCache,
-    nextitem: pytest.Item | None,
+    plan: GroupPlan,
 ) -> None:
-    """Choose and invoke the appropriate execution path for a swarm group.
+    """Run a swarm group in worker threads.
 
-    Parallel full path: setup + call + teardown entirely per thread; broad-scope
-    fixtures pre-fetched in main thread and shared via *cache*.
+    Setup, call and teardown all happen per thread; broad-scope fixtures are
+    pre-fetched in the main thread and shared via *cache*, except parametrized ones,
+    which get one instance per parameter value.
 
-    Serial setup path: sequential setup, parallel bodies, sequential teardown;
-    used when broad-scope fixtures are indirect-parametrized or require a real
-    FixtureRequest (e.g. built-in pytest fixtures).
+    Groups planned MODE_SEQUENTIAL never reach here — the runner leaves them to
+    pytest's ordinary protocol.
     """
-    if _can_run_parallel_setup(items):
-        _run_items_parallel_full(items, session, max_workers, cache)
-    else:
-        _run_group_serial_setup(items, session, max_workers, nextitem)
+    assert plan.mode != MODE_SEQUENTIAL, "sequential groups are run by the main loop"
+    _run_items_parallel_full(items, session, max_workers, cache)

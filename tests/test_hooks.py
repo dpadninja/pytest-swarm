@@ -104,7 +104,7 @@ def test_items(n):
 
     @staticmethod
     def _serial_src() -> str:
-        """Test file with a session-scope fixture → serial-setup path."""
+        """Test file with a shared session-scope fixture (pre-fetched, then shared)."""
         return """
 import pytest
 
@@ -120,7 +120,7 @@ def test_items(n, sess):
 
     @staticmethod
     def _indirect_src() -> str:
-        """Indirect parametrize → _can_run_parallel_setup=False → serial-setup path."""
+        """Indirect parametrize → one broad-scope instance per parameter value."""
         return """
 import pytest
 
