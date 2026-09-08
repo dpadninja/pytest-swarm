@@ -54,79 +54,97 @@ def _run_finalizers(fins: list) -> None:
 # Broad-scope fixture cache
 # ---------------------------------------------------------------------------
 
+def _scope_node(item: pytest.Item, fd: Any, scope: str) -> Any:
+    """The collector node that owns an instance of *fd* at *scope*.
+
+    Mirrors SubRequest.node in _pytest.fixtures — the node pytest itself attaches
+    the fixture's finalizer to, and therefore what decides how long the instance
+    lives in an ordinary run. Keying on nodes rather than on paths is what makes
+    nested packages behave: a package fixture belongs to the Package that *defines*
+    it, so an item in ``pkg/sub`` keeps ``Package(pkg)``'s instance alive instead of
+    reading as a new package and tearing it down on the way in.
+    """
+    if scope == "session":
+        return item.session
+    if scope == "package":
+        # Not the nearest Package but the one the fixture is defined in, matching
+        # get_scope_package(); a subpackage does not get an instance of its own.
+        for parent in reversed(item.listchain()):
+            if isinstance(parent, pytest.Package) and parent.nodeid == fd.baseid:
+                return parent
+        return item.session
+    if scope == "module":
+        return item.getparent(pytest.Module) or item
+    # class — pytest falls back to the item itself when there is no class
+    return item.getparent(pytest.Class) or item
+
+
+def _node_depth(node: Any) -> int:
+    """How deep *node* sits in the collection tree — Session is 1."""
+    return len(node.listchain())
+
+
 @dataclass
 class BroadScopeCache:
     """Shared cache for broad-scope (session / package / module / class) fixtures.
 
     Fixtures are pre-fetched in the main thread and shared among parallel workers.
-    Teardown methods clear the corresponding level and run its finalizers.
+    Each instance is filed under the collector node that owns its scope, exactly as
+    pytest files its own finalizers on the SetupState stack, and is torn down once
+    the run leaves that node — see advance_to.
     """
 
-    session: dict[str, Any] = field(default_factory=dict)
-    session_fin: list = field(default_factory=list)
-    package: dict[str, Any] = field(default_factory=dict)
-    package_fin: list = field(default_factory=list)
-    module: dict[str, Any] = field(default_factory=dict)
-    module_fin: list = field(default_factory=list)
-    klass: dict[str, Any] = field(default_factory=dict)
-    klass_fin: list = field(default_factory=list)
+    #: node -> (values published by that node, finalizers to run when it is left)
+    stack: dict = field(default_factory=dict)
+
+    def _entry(self, node: Any) -> tuple:
+        entry = self.stack.get(node)
+        if entry is None:
+            entry = ({}, [])
+            self.stack[node] = entry
+        return entry
 
     def merged(self) -> dict[str, Any]:
         """All cached values merged into one dict (narrower scopes win on collision)."""
-        return {**self.session, **self.package, **self.module, **self.klass}
+        merged: dict[str, Any] = {}
+        for node in sorted(self.stack, key=_node_depth):
+            merged.update(self.stack[node][0])
+        return merged
 
-    def store(self, scope: str, name: str, value: Any, fins: list) -> None:
-        """Store *value* in the bucket that matches *scope* and record its finalizers."""
-        if scope == "session":
-            self.session[name] = value
-            self.session_fin.extend(fins)
-        elif scope == "package":
-            self.package[name] = value
-            self.package_fin.extend(fins)
-        elif scope == "module":
-            self.module[name] = value
-            self.module_fin.extend(fins)
-        else:  # class
-            self.klass[name] = value
-            self.klass_fin.extend(fins)
+    def store(self, node: Any, name: str, value: Any, fins: list) -> None:
+        """Publish *value* under *node* and record its finalizers there."""
+        values, finalizers = self._entry(node)
+        values[name] = value
+        finalizers.extend(fins)
 
-    def add_finalizers(self, scope: str, fins: list) -> None:
-        """Record finalizers at *scope* without publishing a shared value.
+    def add_finalizers(self, node: Any, fins: list) -> None:
+        """Record finalizers on *node* without publishing a shared value.
 
         Used for parametrized broad-scope fixtures: several instances of the same
         name are alive at once, so no single one of them can own the cache slot,
         but every one of them must still be torn down at the right boundary.
         """
-        if scope == "session":
-            self.session_fin.extend(fins)
-        elif scope == "package":
-            self.package_fin.extend(fins)
-        elif scope == "module":
-            self.module_fin.extend(fins)
-        else:  # class
-            self.klass_fin.extend(fins)
+        self._entry(node)[1].extend(fins)
 
-    def teardown_class(self) -> None:
-        _teardown_silent(self.klass_fin)
-        self.klass.clear()
-        self.klass_fin.clear()
+    def advance_to(self, item: pytest.Item) -> None:
+        """Tear down every cached node *item* does not descend from.
 
-    def teardown_module(self) -> None:
-        self.teardown_class()
-        _teardown_silent(self.module_fin)
-        self.module.clear()
-        self.module_fin.clear()
-
-    def teardown_package(self) -> None:
-        self.teardown_module()
-        _teardown_silent(self.package_fin)
-        self.package.clear()
-        self.package_fin.clear()
+        The same rule SetupState.teardown_exact applies: a node whose subtree the
+        run has left is finished, and so is everything cached below it. Must be
+        called for every item in the loop, swarm or not — a plain test is just as
+        much a departure from the previous module or package as a swarm group is.
+        """
+        live = set(item.listchain())
+        self._drop([node for node in self.stack if node not in live])
 
     def teardown_all(self) -> None:
-        self.teardown_package()
-        _teardown_silent(self.session_fin)
-        self.session_fin.clear()
+        self._drop(list(self.stack))
+
+    def _drop(self, nodes: list) -> None:
+        """Finalize *nodes*, narrowest first."""
+        for node in sorted(nodes, key=_node_depth, reverse=True):
+            _values, finalizers = self.stack.pop(node)
+            _teardown_silent(finalizers)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +238,7 @@ def _prefetch_one(
         value = result
 
     all_broad[name] = value
-    store(scope, name, value, fins)
+    store(_scope_node(ref_item, fd, scope), name, value, fins)
 
 
 def _scope_key(name: str, ref_item: pytest.Item, fm: Any) -> int:
@@ -353,8 +371,8 @@ def _prefetch_parametrized_broad_scope(
         rep = members[0]
         local = dict(all_broad)
 
-        def _store(scope: str, name: str, value: Any, fins: list) -> None:
-            cache.add_finalizers(scope, fins)
+        def _store(node: Any, name: str, value: Any, fins: list) -> None:
+            cache.add_finalizers(node, fins)
 
         for name in tainted:
             _prefetch_one(name, rep, session, local, fm, _store)

@@ -44,35 +44,6 @@ class WorkerConfig:
 
 
 # ---------------------------------------------------------------------------
-# Scope-boundary helper
-# ---------------------------------------------------------------------------
-
-def _advance_scope_boundary(
-    item: pytest.Item,
-    cache: BroadScopeCache,
-    current_package: str | None,
-    current_module: str | None,
-    current_class: type | None,
-) -> tuple[str, str, type | None]:
-    """Tear down cached fixtures at the appropriate scope when the boundary changes.
-
-    Returns the updated (package, module, class) tracking triple.
-    """
-    item_package = str(item.path.parent)
-    item_module = str(item.path)
-    item_class = item.cls
-
-    if item_package != current_package:
-        cache.teardown_package()
-    elif item_module != current_module:
-        cache.teardown_module()
-    elif item_class != current_class:
-        cache.teardown_class()
-
-    return item_package, item_module, item_class
-
-
-# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -183,24 +154,23 @@ class SwarmPlugin:
         ]
 
         cache = BroadScopeCache()
-        current_package: str | None = None
-        current_module: str | None = None
-        current_class: type | None = None
         processed: set[str] = set()
 
         for i, item in enumerate(session.items):
             if item.nodeid in processed:
                 continue
 
+            # Every item advances the boundary, not just swarm ones. A plain test
+            # in the next module or package ends the previous one just as surely,
+            # and it is the only thing standing between two swarm groups when the
+            # tests after a swarm-only package are not marked.
+            cache.advance_to(item)
+
             if item.nodeid in threaded_nodeids:
                 base = item.nodeid.split("[")[0]
                 group = parallel_groups[base]
                 for g in group:
                     processed.add(g.nodeid)
-
-                current_package, current_module, current_class = _advance_scope_boundary(
-                    item, cache, current_package, current_module, current_class
-                )
 
                 marker = item.get_closest_marker(MARKER)
                 max_workers = worker_cfg.resolve(marker)
